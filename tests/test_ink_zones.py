@@ -379,3 +379,71 @@ def test_short_flip_back_full_page_rect_fills_slot_zones():
 def test_invalid_duplex_flip_raises():
     with pytest.raises(ValueError):
         _ink([], duplex_flip="side")
+
+
+def test_narrow_rect_at_paper_edge_not_dropped():
+    # 回归：极窄矩形（页内 x=99.99999999999999、宽 1e-14）贴页面右缘，
+    # 第 1 页在正面右槽（x=100）-> 纸面 199.99999999999999..200；
+    # 浮点下槽位 x + 页内 x 圆整为 200.0，矩形整面丢失（正面缺失）。
+    # 按最短十进制精确计算后，正面第 4 墨区应返回青面积 1e-14 × 100 = 1e-12
+    result = _ink([(1, [(99.99999999999999, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])])
+    sheet = result["signatures"][0]["sheets"][0]
+    assert "back" not in sheet
+    front = _zones(result)["front"]
+    assert list(front) == [4]
+    assert front[4]["cyan_mm2"] == 1e-12
+    assert front[4]["magenta_mm2"] == 0.0
+    assert front[4]["yellow_mm2"] == 0.0
+    assert front[4]["black_mm2"] == 0.0
+
+
+def test_narrow_rect_at_paper_edge_right_binding():
+    # 右装订：第 4 页在正面右槽（x=100），同一极窄矩形同样不得被省略
+    result = _ink(
+        [(4, [(99.99999999999999, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+        binding="right",
+    )
+    front = _zones(result)["front"]
+    assert list(front) == [4]
+    assert front[4]["cyan_mm2"] == 1e-12
+
+
+def test_narrow_rect_short_flip_back_180():
+    # short 背面 180°：背左 = 第 2 页（x=0），页内 (0,0,1e-14,100)
+    # -> 纸面 x = 100 − 0 − 1e-14 = 99.99999999999999..100，落区 2；
+    # 浮点下交叠宽被舍入为约 9.95e-15（错计），精确计算应恰为 1e-14
+    result = _ink(
+        [(2, [(0.0, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+        duplex_flip="short",
+    )
+    back = _zones(result)["back"]
+    assert list(back) == [2]
+    assert back[2]["cyan_mm2"] == 1e-12
+
+
+def test_narrow_rect_split_across_zones_conserves_area():
+    # 极窄矩形跨墨区边界：第 4 页正面左槽，页内 x=49.99999999999999、宽 2e-14
+    # -> 纸面 49.99999999999999..50.00000000000001，跨区 1/2 各交叠 1e-14；
+    # 拆分面积之和须严格等于矩形面积（2e-14 × 100 = 2e-12）
+    result = _ink([(4, [(49.99999999999999, 0.0, 2e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])])
+    front = _zones(result)["front"]
+    assert list(front) == [1, 2]
+    assert front[1]["cyan_mm2"] == 1e-12
+    assert front[2]["cyan_mm2"] == 1e-12
+    assert front[1]["cyan_mm2"] + front[2]["cyan_mm2"] == 2e-12
+
+
+def test_exact_ratio_zone_boundaries_conserve_area():
+    # 3 墨区边界为 200/3、400/3（无有限十进制表示），按精确比例表达：
+    # 第 4 页整页矩形（纸面 0..100）拆分面积之和严格守恒为 10000
+    result = _ink(
+        [(4, [(0.0, 0.0, 100.0, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+        zone_count=3,
+    )
+    front = _zones(result)["front"]
+    assert list(front) == [1, 2]
+    assert front[1]["cyan_mm2"] == pytest.approx(20000 / 3, rel=1e-12)
+    assert front[2]["cyan_mm2"] == pytest.approx(10000 / 3, rel=1e-12)
+    assert front[1]["cyan_mm2"] + front[2]["cyan_mm2"] == pytest.approx(
+        10000.0, rel=1e-12
+    )

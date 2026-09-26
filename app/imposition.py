@@ -20,6 +20,7 @@ from __future__ import annotations
 import bisect
 import math
 from decimal import Decimal, localcontext
+from fractions import Fraction
 from typing import Collection, List, Literal, Optional, Tuple, TypeVar, Union
 
 from .press_geometry import (
@@ -399,9 +400,10 @@ def ink_zones(
     """按等宽墨区统计各通道等效着墨面积（已乘印数）。
 
     页序、分帖、槽位与旋转规则与 :func:`press_layout` 完全同源（统一由
-    :class:`PressGeometry` 决定）。每个页内矩形（以页面左上角为原点）先经
-    :meth:`PressGeometry.page_rect_to_paper` 按所在页位的 ``rotation_deg``
-    映射到纸面坐标：
+    :class:`PressGeometry` 决定）。每个页内矩形（以页面左上角为原点）按所在
+    页位的 ``rotation_deg`` 映射到纸面坐标（规则与
+    :meth:`PressGeometry.page_rect_to_paper` 一致，实际计算使用十进制精确
+    版本 :func:`_page_rect_to_paper_decimal`）：
 
     - 0°：纸面左上角 = 槽位左上角 + 矩形左上角，宽高不变；
     - 180°：绕页位中心旋转，纸面左上角 =
@@ -410,6 +412,12 @@ def ink_zones(
     纸面按宽度等分为 ``zone_count`` 个墨区（1～16），矩形与墨区按交叠面积
     拆分；某通道在某墨区的等效着墨面积为
     ``Σ 交叠面积 × 该矩形该通道覆盖率``，再乘印数 ``copies``（正整数）。
+
+    纸面平移、180° 旋转与墨区交集一律按解析后数值的**最短十进制值**精确
+    计算，等分墨区边界用**精确比例**（``Fraction``，纸面宽 × k / 墨区数）
+    表达，覆盖率累计与乘印数都在精确值上完成，只在生成响应时转换为浮点
+    （相对误差不超过 2^-53）：极窄矩形（如宽 1e-14 mm）不会被坐标舍入
+    吞掉，跨墨区拆分的面积总和严格守恒，可表示的非零结果不会被省略。
 
     按帖、张、正反面与墨区返回结果；空白页位（末帖补白）不参与统计，
     任何通道均为 0 的墨区也不输出（矩形落在中缝内的部分同理为 0）。
@@ -480,8 +488,11 @@ def ink_zones(
             page_sizes.extend(rect_d)
             parsed.append(((rx, ry, rw, rh, c, m, y_value, k), rect_d, rect_index))
 
-        validated: List[PageRect] = []
-        validated_d: List[DecimalRect] = []
+        # 校验通过后保留十进制矩形与十进制覆盖率，
+        # 供纸面映射与墨区交集按最短十进制值精确计算
+        validated: List[
+            Tuple[DecimalRect, Tuple[Decimal, Decimal, Decimal, Decimal]]
+        ] = []
         # 精度覆盖本页全部尺寸，保证边界与交叠判定精确无舍入
         with localcontext() as ctx:
             ctx.prec = _decimal_prec(*page_sizes)
@@ -509,17 +520,26 @@ def ink_zones(
                             f"第 {page} 页第 {rect_index} 个矩形的 {channel} 通道"
                             f"覆盖率 {coverage} 越界，须在 0～1 之间"
                         )
-                for other_d in validated_d:
+                for other_d, _other_coverages in validated:
                     if _rects_overlap_decimal(other_d, rect_d):
                         raise ValueError(
                             f"第 {page} 页的页内矩形互不重叠：第 {rect_index} 个矩形"
                             f" ({rx}, {ry}, {rw}, {rh}) 与此前矩形正面积交叠"
                         )
-                validated.append((rx, ry, rw, rh, c, m, y_value, k))
-                validated_d.append(rect_d)
+                validated.append(
+                    (
+                        rect_d,
+                        (
+                            _to_decimal(c),
+                            _to_decimal(m),
+                            _to_decimal(y_value),
+                            _to_decimal(k),
+                        ),
+                    )
+                )
         inks_by_page[page] = validated
 
-    geometry, layout = _build_press_layout(
+    _geometry, layout = _build_press_layout(
         total_pages,
         max_sheets,
         binding,
@@ -532,68 +552,103 @@ def ink_zones(
     paper_height = layout["paper_height_mm"]
     zone_width = paper_width / zone_count
 
+    # 纸面平移、180° 旋转与墨区交集一律按解析后数值的最短十进制值精确计算：
+    # 极窄矩形（如页内 x = 99.99999999999999、宽 1e-14）在二进制浮点下会被
+    # 坐标舍入吞掉（槽位 x + 页内 x 圆整到纸面边缘后矩形整面丢失），
+    # 十进制映射加精确比例的墨区边界保证可表示的非零结果不被省略
+    gutter_d = _to_decimal(gutter_mm)
+    all_sizes = [page_width_d, page_height_d, gutter_d]
+    for page_rects in inks_by_page.values():
+        for rect_d, _coverages_d in page_rects:
+            all_sizes.extend(rect_d)
+
     result_signatures: List[dict] = []
-    for signature in layout["signatures"]:
-        result_sheets: List[dict] = []
-        for sheet in signature["sheets"]:
-            sides: dict = {}
-            for side in ("front", "back"):
-                # totals[墨区索引] = [青, 品, 黄, 黑] 累计等效面积（未乘印数）
-                totals = [[0.0, 0.0, 0.0, 0.0] for _ in range(zone_count)]
-                for slot in ("left", "right"):
-                    placement = sheet[side][slot]
-                    if placement is None:
-                        continue  # 空白页位（末帖补白）不计
-                    rects = inks_by_page.get(placement.page)
-                    if not rects:
-                        continue
-                    for rx, ry, rw, rh, c, m, y_value, k in rects:
-                        # 页内矩形 -> 纸面矩形（共享的双向矩形变换）
-                        px, py, rw, rh = geometry.page_rect_to_paper(
-                            placement, rx, ry, rw, rh
-                        )
-                        first = max(0, int(math.floor(px / zone_width)))
-                        last = min(
-                            zone_count - 1,
-                            int(math.floor((px + rw) / zone_width)),
-                        )
-                        for zone_index in range(first, last + 1):
-                            overlap_w = (
-                                min(px + rw, (zone_index + 1) * zone_width)
-                                - max(px, zone_index * zone_width)
+    # 精度覆盖全部纸面尺寸与页内矩形尺寸，保证十进制映射精确无舍入
+    with localcontext() as ctx:
+        ctx.prec = _decimal_prec(*all_sizes)
+        paper_width_d = 2 * page_width_d + gutter_d
+        # 等分墨区边界按精确比例表达：纸面宽 × k / 墨区数不一定有有限十进制
+        # 表示（如 100 / 3），用 Fraction 比例不会引入任何舍入
+        zone_edges = [
+            Fraction(paper_width_d) * zone_index / zone_count
+            for zone_index in range(zone_count + 1)
+        ]
+        for signature in layout["signatures"]:
+            result_sheets: List[dict] = []
+            for sheet in signature["sheets"]:
+                sides: dict = {}
+                for side in ("front", "back"):
+                    # totals[墨区索引] = [青, 品, 黄, 黑] 累计等效面积（未乘印数），
+                    # 全程按精确比例累计，跨墨区拆分的面积总和严格守恒
+                    totals = [
+                        [Fraction(0), Fraction(0), Fraction(0), Fraction(0)]
+                        for _ in range(zone_count)
+                    ]
+                    for slot in ("left", "right"):
+                        placement = sheet[side][slot]
+                        if placement is None:
+                            continue  # 空白页位（末帖补白）不计
+                        rects = inks_by_page.get(placement.page)
+                        if not rects:
+                            continue
+                        for rect_d, coverages_d in rects:
+                            # 页内矩形 -> 纸面矩形（最短十进制值精确平移/旋转）
+                            px_d, _py_d, rw_d, rh_d = _page_rect_to_paper_decimal(
+                                slot,
+                                placement.rotation_deg,
+                                page_width_d,
+                                page_height_d,
+                                gutter_d,
+                                rect_d,
                             )
-                            if overlap_w <= 0.0:
-                                continue
-                            area = overlap_w * rh
-                            totals[zone_index][0] += area * c
-                            totals[zone_index][1] += area * m
-                            totals[zone_index][2] += area * y_value
-                            totals[zone_index][3] += area * k
-                zones = []
-                for zone_index, channel_totals in enumerate(totals):
-                    if any(value > 0.0 for value in channel_totals):
-                        zones.append(
-                            {
-                                "zone_index": zone_index + 1,
-                                "cyan_mm2": channel_totals[0] * copies,
-                                "magenta_mm2": channel_totals[1] * copies,
-                                "yellow_mm2": channel_totals[2] * copies,
-                                "black_mm2": channel_totals[3] * copies,
-                            }
-                        )
-                if zones:
-                    sides[side] = zones
-            result_sheets.append(
-                {"sheet_index": sheet["sheet_index"], **sides}
+                            # 墨区交集按精确比例计算
+                            rect_left = Fraction(px_d)
+                            rect_right = rect_left + Fraction(rw_d)
+                            rect_height = Fraction(rh_d)
+                            coverages = [Fraction(value) for value in coverages_d]
+                            for zone_index in range(zone_count):
+                                overlap_w = min(
+                                    rect_right, zone_edges[zone_index + 1]
+                                ) - max(rect_left, zone_edges[zone_index])
+                                if overlap_w <= 0:
+                                    continue
+                                area = overlap_w * rect_height
+                                channel_totals = totals[zone_index]
+                                for channel_index, coverage in enumerate(coverages):
+                                    channel_totals[channel_index] += area * coverage
+                    zones = []
+                    for zone_index, channel_totals in enumerate(totals):
+                        if any(value > 0 for value in channel_totals):
+                            # 累计覆盖率与印数后再转为浮点响应；唯一的舍入来自
+                            # 最终的 float 转换（相对误差不超过 2^-53）
+                            zones.append(
+                                {
+                                    "zone_index": zone_index + 1,
+                                    "cyan_mm2": float(channel_totals[0] * copies),
+                                    "magenta_mm2": float(
+                                        channel_totals[1] * copies
+                                    ),
+                                    "yellow_mm2": float(
+                                        channel_totals[2] * copies
+                                    ),
+                                    "black_mm2": float(
+                                        channel_totals[3] * copies
+                                    ),
+                                }
+                            )
+                    if zones:
+                        sides[side] = zones
+                result_sheets.append(
+                    {"sheet_index": sheet["sheet_index"], **sides}
+                )
+            result_signatures.append(
+                {
+                    "signature_index": signature["signature_index"],
+                    "sheet_count": signature["sheet_count"],
+                    "page_count_padded": signature["page_count_padded"],
+                    "sheets": result_sheets,
+                }
             )
-        result_signatures.append(
-            {
-                "signature_index": signature["signature_index"],
-                "sheet_count": signature["sheet_count"],
-                "page_count_padded": signature["page_count_padded"],
-                "sheets": result_sheets,
-            }
-        )
 
     return {
         "total_pages": total_pages,
@@ -638,13 +693,13 @@ def _page_rect_to_paper_decimal(
     gutter_d: Decimal,
     rect: DecimalRect,
 ) -> DecimalRect:
-    """页内矩形 -> 纸面矩形的十进制精确映射（trim-safety 安全判定专用）。
+    """页内矩形 -> 纸面矩形的十进制精确映射（trim-safety 与 ink-zones 共用）。
 
     规则与 :meth:`PressGeometry.page_rect_to_paper` 一一对应（槽位原点见
     :meth:`PressGeometry.slot_origin_x_mm`：左槽 ``x = 0``、右槽
     ``x = 页宽 + 中缝``，``y`` 恒为 0；0° 平移、180° 绕页位中心旋转，
     宽高均不变），只是全部按十进制尺寸计算，避免二进制浮点误差影响
-    贴线判定。
+    贴线判定与极窄矩形的墨区交集。
     """
     x_d, y_d, width_d, height_d = rect
     slot_x_d = Decimal(0) if slot == "left" else page_width_d + gutter_d

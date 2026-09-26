@@ -1703,6 +1703,30 @@ def test_ink_zones_missing_field_returns_422():
     assert response.status_code == 422
 
 
+def test_ink_zones_narrow_rect_at_paper_edge_not_dropped():
+    # 回归：极窄矩形（页内 x=99.99999999999999、宽 1e-14）贴页面右缘，
+    # 浮点坐标舍入曾把矩形整体吞掉导致正面缺失；按最短十进制精确计算后，
+    # 正面第 4 墨区应返回青面积 1e-12（其余通道为 0，背面整面缺省）
+    body = {
+        **INK_ZONES_BASE,
+        "page_inks": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 99.99999999999999, "y_mm": 0, "width_mm": 1e-14,
+                 "height_mm": 100, "cyan": 1, "magenta": 0, "yellow": 0,
+                 "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert sheet["front"] == [
+        {"zone_index": 4, "cyan_mm2": 1e-12, "magenta_mm2": 0.0,
+         "yellow_mm2": 0.0, "black_mm2": 0.0},
+    ]
+    assert "back" not in sheet
+
+
 # ---------------------------------------------------------------------------
 # 外裁/折缝安全检查 /api/v1/impose/trim-safety
 # ---------------------------------------------------------------------------
