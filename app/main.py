@@ -45,7 +45,8 @@ app = FastAPI(
         "与阅读方向的页内坐标，中缝与空白页位单独标记。"
         "支持墨区着墨面积：页内矩形按解析后数值的最短十进制表示严格校验"
         "（贴边合法，任何越界或同页正面积交叠均 422），随页位 0°/180° 方向"
-        "映射到纸面，跨等宽墨区按交叠面积拆分，"
+        "按精确有理数额映射到纸面，等分墨区边界用精确比例表达、按交叠面积拆分，"
+        "可表示的非零结果不因坐标舍入被省略（跨墨区拆分面积总和守恒），"
         "按帖/张/正反面/墨区给出 CMYK 各通道等效着墨面积乘印数。"
         "支持外裁/折缝安全检查：按实际页码给出阅读方向的受保护内容矩形，映射到纸面后"
         "逐张逐面核对中缝侧折缝安全距离与其余三边外裁安全距离（贴安全线合格），"
@@ -1336,7 +1337,7 @@ def create_locate_defects(request: LocateDefectsRequest) -> LocateDefectsRespons
     response_model=InkZonesResponse,
     response_model_exclude_none=True,
     tags=["拼版"],
-    summary="墨区着墨面积：页内矩形按页位映射后跨等宽墨区拆分",
+    summary="墨区着墨面积：页内矩形按页位精确映射后跨等宽墨区拆分",
 )
 def create_ink_zones(request: InkZonesRequest) -> InkZonesResponse:
     result = ink_zones(

@@ -379,3 +379,109 @@ def test_short_flip_back_full_page_rect_fills_slot_zones():
 def test_invalid_duplex_flip_raises():
     with pytest.raises(ValueError):
         _ink([], duplex_flip="side")
+
+
+def test_ultra_narrow_rect_on_zone_boundary_is_counted():
+    # 回归：合法极窄矩形（宽 1e-14）贴在墨区分界上时，旧实现经二进制浮点
+    # 把 200.0 + 1e-14 舍回 200.0，交叠宽算成 0，整面缺失。
+    # 第 1 页正面右槽：页内 x=99.99999999999999、w=1e-14 -> 纸面 200−1e-14..200，
+    # 恰好只与第 4 墨区相交，青面积 1e-14 × 100 × 1 = 1e-12
+    result = _ink(
+        [(1, [(99.99999999999999, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+    )
+    front = _zones(result)["front"]
+    assert set(front) == {4}
+    assert front[4]["cyan_mm2"] == pytest.approx(1e-12, abs=1e-24)
+    # 印数在精确累计之后再乘：7 × 1e-12
+    result = _ink(
+        [(1, [(99.99999999999999, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+        copies=7,
+    )
+    front = _zones(result)["front"]
+    assert front[4]["cyan_mm2"] == pytest.approx(7e-12, abs=1e-24)
+
+
+def test_ultra_narrow_rect_straddling_zone_boundary_splits_exactly():
+    # 跨墨区的极窄矩形按精确比例边界拆分，两片面积之和严格守恒：
+    # 第 4 页正面左槽，页内 50−1e-14 .. 50+1e-14（纸面，4 墨区每区 50），
+    # 第 1、2 墨区各得宽 1e-14、高 100 -> 各 1e-12
+    result = _ink(
+        [(4, [(49.99999999999999, 0.0, 2e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+    )
+    front = _zones(result)["front"]
+    assert set(front) == {1, 2}
+    assert front[1]["cyan_mm2"] == pytest.approx(1e-12, abs=1e-24)
+    assert front[2]["cyan_mm2"] == pytest.approx(1e-12, abs=1e-24)
+    assert front[1]["cyan_mm2"] + front[2]["cyan_mm2"] == pytest.approx(
+        2e-12, abs=1e-24
+    )
+
+
+def test_ultra_narrow_rect_on_non_integral_ratio_boundary_conserves():
+    # 等分边界为除不尽的精确比例（纸面 220、3 墨区，边界 73⅓、146⅔）时，
+    # 极窄矩形同样不得被舍入吞没；各拆分片总和等于矩形总面积 1e-12
+    # 第 1 页正面右槽（槽位 x=120），页内 x 取在纸面边界 146.666... 左侧 1e-14
+    result = _ink(
+        [(1, [(146.66666666666666 - 120.0, 0.0, 1e-14, 100.0,
+              0.0, 1.0, 0.0, 0.0)])],
+        gutter_mm=20.0,
+        zone_count=3,
+    )
+    front = _zones(result)["front"]
+    total = sum(z["magenta_mm2"] for z in front.values())
+    assert total == pytest.approx(1e-12, abs=1e-24)
+    # 相对误差远小于 1e-12
+    assert abs(total - 1e-12) / 1e-12 <= 1e-12
+    assert set(front) <= {2, 3}
+
+
+def test_ultra_narrow_rect_short_flip_back_180():
+    # short 背面 180°：第 2 页背左槽，页内 x=0、w=1e-14 ->
+    # 纸面 100−1e-14..100，4 墨区下只落第 2 墨区，面积 1e-12
+    result = _ink(
+        [(2, [(0.0, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+        duplex_flip="short",
+    )
+    back = _zones(result)["back"]
+    assert set(back) == {2}
+    assert back[2]["cyan_mm2"] == pytest.approx(1e-12, abs=1e-24)
+
+
+def test_ultra_narrow_rect_right_binding():
+    # 右装订正面：第 1 页在左槽（x=0），极窄贴右边矩形 -> 纸面 ~100 落第 2 墨区
+    result = _ink(
+        [(1, [(99.99999999999999, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+        binding="right",
+    )
+    front = _zones(result)["front"]
+    assert set(front) == {2}
+    assert front[2]["cyan_mm2"] == pytest.approx(1e-12, abs=1e-24)
+    # 第 4 页在右槽（x=100）-> 纸面 ~200 落第 4 墨区
+    result = _ink(
+        [(4, [(99.99999999999999, 0.0, 1e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])],
+        binding="right",
+    )
+    front = _zones(result)["front"]
+    assert set(front) == {4}
+    assert front[4]["cyan_mm2"] == pytest.approx(1e-12, abs=1e-24)
+
+
+def test_split_area_conservation_full_page_rect():
+    # 守恒性质：整页矩形（面积 10000）拆到 3 个墨区（纸面 200 除不尽）后，
+    # 各片面积总和仍为 10000（×覆盖率×印数），不丢不多
+    result = _ink(
+        [(1, [(0.0, 0.0, 100.0, 100.0, 0.25, 0.0, 0.0, 0.0)])],
+        zone_count=3,
+        copies=3,
+    )
+    front = _zones(result)["front"]
+    assert set(front) == {2, 3}
+    total = sum(z["cyan_mm2"] for z in front.values())
+    # 10000 × 0.25 × 3 = 7500
+    assert total == pytest.approx(7500.0, rel=1e-12)
+
+
+def test_ultra_narrow_rect_still_rejects_out_of_page():
+    # 极窄矩形的 422 规则不变：右边微越页界（十进制严格判定）仍拒绝
+    with pytest.raises(ValueError):
+        _ink([(1, [(99.99999999999999, 0.0, 2e-14, 100.0, 1.0, 0.0, 0.0, 0.0)])])

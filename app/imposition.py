@@ -20,6 +20,7 @@ from __future__ import annotations
 import bisect
 import math
 from decimal import Decimal, localcontext
+from fractions import Fraction
 from typing import Collection, List, Literal, Optional, Tuple, TypeVar, Union
 
 from .press_geometry import (
@@ -411,6 +412,16 @@ def ink_zones(
     拆分；某通道在某墨区的等效着墨面积为
     ``Σ 交叠面积 × 该矩形该通道覆盖率``，再乘印数 ``copies``（正整数）。
 
+    纸面映射、墨区交集与累计一律按**精确有理数**核算：页内矩形的坐标/宽高
+    先按解析后数值的最短十进制表示取为 ``Decimal``（校验），随后精确转换为
+    ``Fraction``；槽位平移（0°）与绕页位中心旋转（180°）均为有理数精确运算，
+    等分墨区边界用精确比例 ``i × 纸面宽 / 墨区数`` 表达（不预先舍入为单个
+    墨区宽浮点），交叠宽 × 高 × 覆盖率与印数全部以分数累加，仅在序列化响应时
+    才转为 ``float``。因此跨墨区拆分的面积总和严格守恒，合法的极窄矩形
+    （如宽 1e-14 mm、贴在墨区边界上）不会因二进制浮点把
+    ``边界 + 1e-14`` 舍回边界而被整段漏计，结果面积的相对误差不超过 float
+    转换本身（约 1e-16，远小于 1e-12）。
+
     按帖、张、正反面与墨区返回结果；空白页位（末帖补白）不参与统计，
     任何通道均为 0 的墨区也不输出（矩形落在中缝内的部分同理为 0）。
 
@@ -458,8 +469,9 @@ def ink_zones(
             raise ValueError(f"第 {page} 页的页内矩形重复给出，每页只能出现一次")
         if not rects:
             raise ValueError(f"第 {page} 页至少需要给出 1 个页内矩形")
-        # 先逐矩形解析为十进制尺寸（字段完整性与有限性随解析校验）
-        parsed: List[Tuple[PageRect, DecimalRect, int]] = []
+        # 先逐矩形解析为十进制尺寸（字段完整性与有限性随解析校验）；
+        # 覆盖率同样按最短十进制精确取值，后续以精确分数参与面积累加
+        parsed: List[Tuple[PageRect, DecimalRect, Tuple[Fraction, ...], int]] = []
         page_sizes: List[Decimal] = [page_width_d, page_height_d]
         for rect_index, rect in enumerate(rects, start=1):
             if len(rect) != 8:
@@ -477,15 +489,24 @@ def ink_zones(
                 _to_decimal(rw),
                 _to_decimal(rh),
             )
+            cover_d = (_to_decimal(c), _to_decimal(m),
+                       _to_decimal(y_value), _to_decimal(k))
             page_sizes.extend(rect_d)
-            parsed.append(((rx, ry, rw, rh, c, m, y_value, k), rect_d, rect_index))
+            parsed.append(
+                (
+                    (rx, ry, rw, rh, c, m, y_value, k),
+                    rect_d,
+                    tuple(_fraction_from_decimal(v) for v in cover_d),
+                    rect_index,
+                )
+            )
 
-        validated: List[PageRect] = []
+        validated_ink: List[Tuple[DecimalRect, Tuple[Fraction, ...]]] = []
         validated_d: List[DecimalRect] = []
         # 精度覆盖本页全部尺寸，保证边界与交叠判定精确无舍入
         with localcontext() as ctx:
             ctx.prec = _decimal_prec(*page_sizes)
-            for (rx, ry, rw, rh, c, m, y_value, k), rect_d, rect_index in parsed:
+            for (rx, ry, rw, rh, c, m, y_value, k), rect_d, cover_f, rect_index in parsed:
                 rx_d, ry_d, rw_d, rh_d = rect_d
                 # 任何越界都是请求错误：严格按十进制判定，不容差、不夹回页面
                 if rx_d < 0 or ry_d < 0:
@@ -515,11 +536,11 @@ def ink_zones(
                             f"第 {page} 页的页内矩形互不重叠：第 {rect_index} 个矩形"
                             f" ({rx}, {ry}, {rw}, {rh}) 与此前矩形正面积交叠"
                         )
-                validated.append((rx, ry, rw, rh, c, m, y_value, k))
+                validated_ink.append((rect_d, cover_f))
                 validated_d.append(rect_d)
-        inks_by_page[page] = validated
+        inks_by_page[page] = validated_ink
 
-    geometry, layout = _build_press_layout(
+    _geometry, layout = _build_press_layout(
         total_pages,
         max_sheets,
         binding,
@@ -528,57 +549,98 @@ def ink_zones(
         gutter_mm,
         duplex_flip,
     )
-    paper_width = layout["paper_width_mm"]
-    paper_height = layout["paper_height_mm"]
-    zone_width = paper_width / zone_count
+    gutter_d = _to_decimal(gutter_mm)
+    with localcontext() as ctx:
+        ctx.prec = _decimal_prec(page_width_d, gutter_d)
+        paper_width_d = 2 * page_width_d + gutter_d
+    paper_width = float(paper_width_d)
+    paper_height = page_height_mm
 
     result_signatures: List[dict] = []
+    # 槽位原点 / 旋转角只取决于槽位与翻转，按页宽、中缝的精确值各算一次。
+    # 映射与墨区交集全程使用精确分数（Fraction），不经过任何浮点中间量。
+    page_width_f = _fraction_from_decimal(page_width_d)
+    slot_origin_f = {
+        "left": Fraction(0),
+        "right": page_width_f + _fraction_from_decimal(gutter_d),
+    }
+    paper_width_f = _fraction_from_decimal(paper_width_d)
+
+    def _map_rect_to_paper_fraction(
+        slot: str, rotation_deg: Literal[0, 180], rect_d: DecimalRect
+    ) -> Tuple[Fraction, Fraction, Fraction]:
+        """页内矩形（十进制）-> 纸面 (起点 x, 宽, 高) 的精确分数。
+
+        与 :func:`_page_rect_to_paper_decimal` /
+        :meth:`PressGeometry.page_rect_to_paper` 同一规则（0° 平移、180° 绕
+        页位中心旋转，宽高不变）；仅取 x 方向与高度（墨区按宽度等分，y 方向
+        贯通，面积只需要交叠宽 × 矩形高）。十进制先精确转分数，故平移/旋转
+        全程无舍入。
+        """
+        x_d, _y_d, width_d, height_d = rect_d
+        x_f = _fraction_from_decimal(x_d)
+        width_f = _fraction_from_decimal(width_d)
+        height_f = _fraction_from_decimal(height_d)
+        slot_x_f = slot_origin_f[slot]
+        if rotation_deg == 180:
+            x_f = slot_x_f + page_width_f - x_f - width_f
+        else:
+            x_f = slot_x_f + x_f
+        return x_f, width_f, height_f
+
     for signature in layout["signatures"]:
         result_sheets: List[dict] = []
         for sheet in signature["sheets"]:
             sides: dict = {}
             for side in ("front", "back"):
-                # totals[墨区索引] = [青, 品, 黄, 黑] 累计等效面积（未乘印数）
-                totals = [[0.0, 0.0, 0.0, 0.0] for _ in range(zone_count)]
+                # totals[墨区索引] = [青, 品, 黄, 黑] 累计等效面积（未乘印数）。
+                # 全程用精确分数累加：等分边界用 i × 纸面宽 / 墨区数 表达，
+                # 不预先除成单个墨区宽浮点，避免边界附近的极窄交叠被舍入吞没。
+                totals = [
+                    [Fraction(0), Fraction(0), Fraction(0), Fraction(0)]
+                    for _ in range(zone_count)
+                ]
+                zone_width_f = paper_width_f / zone_count
                 for slot in ("left", "right"):
                     placement = sheet[side][slot]
                     if placement is None:
                         continue  # 空白页位（末帖补白）不计
-                    rects = inks_by_page.get(placement.page)
-                    if not rects:
+                    page_ink = inks_by_page.get(placement.page)
+                    if not page_ink:
                         continue
-                    for rx, ry, rw, rh, c, m, y_value, k in rects:
-                        # 页内矩形 -> 纸面矩形（共享的双向矩形变换）
-                        px, py, rw, rh = geometry.page_rect_to_paper(
-                            placement, rx, ry, rw, rh
+                    for rect_d, cover_f in page_ink:
+                        # 页内矩形 -> 纸面矩形（0° 平移 / 180° 旋转，精确分数）
+                        px_f, rw_f, rh_f = _map_rect_to_paper_fraction(
+                            slot, placement.rotation_deg, rect_d
                         )
-                        first = max(0, int(math.floor(px / zone_width)))
-                        last = min(
-                            zone_count - 1,
-                            int(math.floor((px + rw) / zone_width)),
-                        )
-                        for zone_index in range(first, last + 1):
-                            overlap_w = (
-                                min(px + rw, (zone_index + 1) * zone_width)
-                                - max(px, zone_index * zone_width)
+                        right_f = px_f + rw_f
+                        # 矩形是页内合法矩形，纸面投影只会落在本槽或中缝内；
+                        # 逐墨区按精确比例边界求交叠宽，跨区拆分总和严格守恒
+                        for zone_index in range(zone_count):
+                            zone_left = zone_index * zone_width_f
+                            zone_right = (zone_index + 1) * zone_width_f
+                            overlap_w = min(right_f, zone_right) - max(
+                                px_f, zone_left
                             )
-                            if overlap_w <= 0.0:
+                            if overlap_w <= 0:
                                 continue
-                            area = overlap_w * rh
-                            totals[zone_index][0] += area * c
-                            totals[zone_index][1] += area * m
-                            totals[zone_index][2] += area * y_value
-                            totals[zone_index][3] += area * k
+                            area = overlap_w * rh_f
+                            for channel_index in range(len(INK_CHANNELS)):
+                                totals[zone_index][channel_index] += (
+                                    area * cover_f[channel_index]
+                                )
                 zones = []
                 for zone_index, channel_totals in enumerate(totals):
-                    if any(value > 0.0 for value in channel_totals):
+                    # 按精确分数判定“有非零贡献”：可表示的非零结果不会因坐标
+                    # 或中间量的浮点舍入被省略；累计完覆盖率与印数后再转 float
+                    if any(value > 0 for value in channel_totals):
                         zones.append(
                             {
                                 "zone_index": zone_index + 1,
-                                "cyan_mm2": channel_totals[0] * copies,
-                                "magenta_mm2": channel_totals[1] * copies,
-                                "yellow_mm2": channel_totals[2] * copies,
-                                "black_mm2": channel_totals[3] * copies,
+                                "cyan_mm2": float(channel_totals[0] * copies),
+                                "magenta_mm2": float(channel_totals[1] * copies),
+                                "yellow_mm2": float(channel_totals[2] * copies),
+                                "black_mm2": float(channel_totals[3] * copies),
                             }
                         )
                 if zones:
@@ -594,6 +656,11 @@ def ink_zones(
                 "sheets": result_sheets,
             }
         )
+
+    with localcontext() as ctx:
+        # 回显的墨区宽仅用于展示：精度覆盖纸面宽的有效位，除不尽时在此舍入
+        ctx.prec = _decimal_prec(paper_width_d)
+        zone_width = float(paper_width_d / zone_count)
 
     return {
         "total_pages": total_pages,
@@ -644,7 +711,9 @@ def _page_rect_to_paper_decimal(
     :meth:`PressGeometry.slot_origin_x_mm`：左槽 ``x = 0``、右槽
     ``x = 页宽 + 中缝``，``y`` 恒为 0；0° 平移、180° 绕页位中心旋转，
     宽高均不变），只是全部按十进制尺寸计算，避免二进制浮点误差影响
-    贴线判定。
+    贴线判定。ink-zones 的 :func:`ink_zones` 内嵌映射采用同一规则，
+    但在十进制精确解析后转 ``Fraction`` 做墨区交集（见
+    ``_map_rect_to_paper_fraction``），保证极窄交叠不被浮点舍入吞没。
     """
     x_d, y_d, width_d, height_d = rect
     slot_x_d = Decimal(0) if slot == "left" else page_width_d + gutter_d
@@ -1756,6 +1825,16 @@ def _to_decimal(value: DecimalSize) -> Decimal:
     if isinstance(value, int):
         return Decimal(value)
     return Decimal(str(value))
+
+
+def _fraction_from_decimal(value: Decimal) -> Fraction:
+    """把有限十进制 ``Decimal`` 精确转换为有理数 ``Fraction``。
+
+    ``Fraction`` 对 ``Decimal``（含科学计数法，如 ``1E-14``）为精确转换，
+    不发生舍入；ink-zones 的纸面平移、180° 旋转与墨区交集一律在此精确值上
+    进行，保证极窄矩形不会因二进制浮点舍入被漏计。
+    """
+    return Fraction(value)
 
 
 def _decimal_prec(*values: Decimal) -> int:
